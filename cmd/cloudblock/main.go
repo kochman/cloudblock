@@ -5,8 +5,8 @@ import (
 	"os"
 	"time"
 
-	"sidney.kochman.org/cloudblock"
-	"sidney.kochman.org/cloudblock/backends/gcs"
+	"github.com/kochman/cloudblock"
+	"github.com/kochman/cloudblock/backends/gcs"
 )
 
 const megabyte = 1000 * 1000

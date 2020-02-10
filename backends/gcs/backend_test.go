@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"sidney.kochman.org/cloudblock"
+	"github.com/kochman/cloudblock"
 )
 
 func TestWriteRead(t *testing.T) {

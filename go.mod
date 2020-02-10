@@ -1,4 +1,4 @@
-module sidney.kochman.org/cloudblock
+module github.com/kochman/cloudblock
 
 go 1.13
 
