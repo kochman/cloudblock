@@ -7,11 +7,17 @@ import (
 
 	"github.com/kochman/cloudblock"
 	"github.com/kochman/cloudblock/backends/gcs"
+	"github.com/kochman/cloudblock/nbd"
 )
 
 const megabyte = 1000 * 1000
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "server" {
+		nbd.Server()
+		return
+	}
+
 	f, err := gcs.NewBackend("cloudblock-test")
 	if err != nil {
 		log.Printf("unable to create gcs backend: %v", err)
