@@ -60,7 +60,6 @@ func handle(conn net.Conn) {
 		if magic != 0x49484156454F5054 {
 			break
 		}
-		log.Printf("got")
 
 		// read option
 		p = make([]byte, 4)
@@ -73,9 +72,17 @@ func handle(conn net.Conn) {
 		l := binary.BigEndian.Uint32(p)
 
 		// read data
-		p = make([]byte, l)
-		conn.Read(p)
-		log.Printf("got opt [%v] length [%d] data [%v]", opt, l, p)
+		data := make([]byte, l)
+		conn.Read(data)
+		log.Printf("got opt [%v] length [%d] data [%v]", opt, l, data)
+
+		switch opt {
+		case 7: // NBD_OPT_GO
+			p = make([]byte, 4)
+			l := binary.BigEndian.Uint32(data[:4])
+			name := data[4 : 4+l]
+			log.Printf("export name: %s", name)
+		}
 	}
 
 	log.Printf("done")
