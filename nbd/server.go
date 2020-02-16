@@ -82,6 +82,21 @@ func handle(conn net.Conn) {
 			l := binary.BigEndian.Uint32(data[:4])
 			name := data[4 : 4+l]
 			log.Printf("export name: %s", name)
+
+			// always say we don't wanna export (just for now)
+			p = make([]byte, 8)
+			binary.BigEndian.PutUint64(p, 0x3e889045565a9)
+			conn.Write(p)
+
+			p = make([]byte, 4)
+			binary.BigEndian.PutUint32(p, opt)
+			conn.Write(p)
+
+			p = make([]byte, 4)
+			binary.BigEndian.PutUint32(p, (2 ^ 31 + 6))
+			conn.Write(p)
+
+			conn.Write(make([]byte, 4))
 		}
 	}
 
