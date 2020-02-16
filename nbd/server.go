@@ -43,7 +43,40 @@ func handle(conn net.Conn) {
 	binary.BigEndian.PutUint16(p, 0x8000)
 	conn.Write(p)
 
-	p = make([]byte, 40)
+	p = make([]byte, 4)
 	conn.Read(p)
-	log.Printf("got: %v", p)
+	clientFlags := binary.BigEndian.Uint32(p)
+	if clientFlags != 1 {
+		log.Printf("closing conn due to unsupported flags")
+		conn.Close()
+		return
+	}
+
+	// soak up all the client's opts
+	for {
+		p = make([]byte, 8)
+		conn.Read(p)
+		magic := binary.BigEndian.Uint64(p)
+		if magic != 0x49484156454F5054 {
+			break
+		}
+		log.Printf("got")
+
+		// read option
+		p = make([]byte, 4)
+		conn.Read(p)
+		opt := binary.BigEndian.Uint32(p)
+
+		// read length
+		p = make([]byte, 4)
+		conn.Read(p)
+		l := binary.BigEndian.Uint32(p)
+
+		// read data
+		p = make([]byte, l)
+		conn.Read(p)
+		log.Printf("got opt [%v] length [%d] data [%v]", opt, l, p)
+	}
+
+	log.Printf("done")
 }
