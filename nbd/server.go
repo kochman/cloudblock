@@ -1,4 +1,4 @@
-// nbd is a Network Block Device server implemented based on
+// Package nbd is a Network Block Device server implemented based on
 // https://github.com/NetworkBlockDevice/nbd/blob/cb20c16354cccf4698fde74c42f5fb8542b289ae/doc/proto.md
 package nbd
 
@@ -25,38 +25,50 @@ func Server() {
 			log.Printf("unable to accept: %v", err)
 			continue
 		}
-		go handle(conn)
+		c := &connection{nc: conn}
+		go handle(c)
 	}
 }
 
-func handle(conn net.Conn) {
-	log.Printf("handling %s", conn.RemoteAddr())
+type connection struct {
+	nc net.Conn
+}
+
+func handle(c *connection) {
+	log.Printf("handling %s", c.nc.RemoteAddr())
 
 	// write some magic numbers
-	p := make([]byte, 8)
-	binary.BigEndian.PutUint64(p, 0x4e42444d41474943)
-	conn.Write(p)
-	binary.BigEndian.PutUint64(p, 0x49484156454F5054)
-	conn.Write(p)
+	err := c.WriteUint64(0x4e42444d41474943)
+	if err != nil {
+		log.Printf("error: %v", err)
+		return
+	}
+	err = c.WriteUint64(0x49484156454F5054)
+	if err != nil {
+		log.Printf("error: %v", err)
+		return
+	}
 
 	// handshake flags
-	p = make([]byte, 2)
-	binary.BigEndian.PutUint16(p, 0x8000)
-	conn.Write(p)
+	err = c.WriteUint16(0x8000)
+	if err != nil {
+		log.Printf("error: %v", err)
+		return
+	}
 
-	p = make([]byte, 4)
-	conn.Read(p)
+	p := make([]byte, 4)
+	c.nc.Read(p)
 	clientFlags := binary.BigEndian.Uint32(p)
 	if clientFlags != 1 {
 		log.Printf("closing conn due to unsupported flags")
-		conn.Close()
+		c.nc.Close()
 		return
 	}
 
 	// soak up all the client's opts
 	for {
 		p = make([]byte, 8)
-		conn.Read(p)
+		c.nc.Read(p)
 		magic := binary.BigEndian.Uint64(p)
 		if magic != 0x49484156454F5054 {
 			break
@@ -64,17 +76,17 @@ func handle(conn net.Conn) {
 
 		// read option
 		p = make([]byte, 4)
-		conn.Read(p)
+		c.nc.Read(p)
 		opt := binary.BigEndian.Uint32(p)
 
 		// read length
 		p = make([]byte, 4)
-		conn.Read(p)
+		c.nc.Read(p)
 		l := binary.BigEndian.Uint32(p)
 
 		// read data
 		data := make([]byte, l)
-		err := ReadN(conn, data)
+		err := ReadN(c.nc, data)
 		if err != nil {
 			log.Printf("unable to ReadN: %v", err)
 			break
@@ -91,22 +103,22 @@ func handle(conn net.Conn) {
 			// always say we don't wanna export (just for now)
 			p = make([]byte, 8)
 			binary.BigEndian.PutUint64(p, 0x3e889045565a9)
-			conn.Write(p)
+			c.nc.Write(p)
 
 			p = make([]byte, 4)
 			binary.BigEndian.PutUint32(p, opt)
-			conn.Write(p)
+			c.nc.Write(p)
 
 			p = make([]byte, 4)
 			binary.BigEndian.PutUint32(p, (2 ^ 31 + 6))
-			conn.Write(p)
+			c.nc.Write(p)
 
-			conn.Write(make([]byte, 4))
+			c.nc.Write(make([]byte, 4))
 
 		default:
 			p = make([]byte, 8)
 			binary.BigEndian.PutUint64(p, 2^31+1)
-			conn.Write(p)
+			c.nc.Write(p)
 		}
 	}
 
@@ -123,4 +135,25 @@ func ReadN(r io.Reader, p []byte) error {
 		i += thisRead
 	}
 	return nil
+}
+
+func (c *connection) WriteUint16(data uint16) error {
+	p := make([]byte, 2)
+	binary.BigEndian.PutUint16(p, data)
+	_, err := c.nc.Write(p)
+	return err
+}
+
+func (c *connection) WriteUint32(data uint32) error {
+	p := make([]byte, 4)
+	binary.BigEndian.PutUint32(p, data)
+	_, err := c.nc.Write(p)
+	return err
+}
+
+func (c *connection) WriteUint64(data uint64) error {
+	p := make([]byte, 8)
+	binary.BigEndian.PutUint64(p, data)
+	_, err := c.nc.Write(p)
+	return err
 }
