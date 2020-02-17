@@ -4,6 +4,7 @@ package nbd
 
 import (
 	"encoding/binary"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -73,7 +74,11 @@ func handle(conn net.Conn) {
 
 		// read data
 		data := make([]byte, l)
-		conn.Read(data)
+		err := ReadN(conn, data)
+		if err != nil {
+			log.Printf("unable to ReadN: %v", err)
+			break
+		}
 		log.Printf("got opt [%v] length [%d] data [%v]", opt, l, data)
 
 		switch opt {
@@ -97,8 +102,25 @@ func handle(conn net.Conn) {
 			conn.Write(p)
 
 			conn.Write(make([]byte, 4))
+
+		default:
+			p = make([]byte, 8)
+			binary.BigEndian.PutUint64(p, 2^31+1)
+			conn.Write(p)
 		}
 	}
 
 	log.Printf("done")
+}
+
+func ReadN(r io.Reader, p []byte) error {
+	lr := io.LimitReader(r, int64(len(p)))
+	for i := 0; i < len(p); i++ {
+		thisRead, err := lr.Read(p[i:])
+		if err != nil {
+			return err
+		}
+		i += thisRead
+	}
+	return nil
 }
