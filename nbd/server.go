@@ -315,6 +315,7 @@ func handleTransmission(c *connection, e *export) {
 			handleRead(c, e.h, handle, offset, length)
 		case 1:
 			log.Printf("write request: offset %d length %d", offset, length)
+			handleWrite(c, e.h, handle, offset, length)
 		case 2:
 			log.Printf("disconnect request")
 			return
@@ -350,6 +351,42 @@ func handleRead(c *connection, h cloudblock.Handle, handle, offset uint64, lengt
 		return
 	}
 	err = c.Write(p)
+	if err != nil {
+		log.Printf("error: %v", err)
+		return
+	}
+	err = c.Flush()
+	if err != nil {
+		log.Printf("error: %v", err)
+		return
+	}
+}
+
+func handleWrite(c *connection, h cloudblock.Handle, handle, offset uint64, length uint32) {
+	p := make([]byte, length)
+	err := c.ReadFull(p)
+	if err != nil {
+		log.Printf("error handling write: %v", err)
+		return
+	}
+	err = h.WriteAt(p, offset)
+	if err != nil {
+		log.Printf("error handling write: %v", err)
+		return
+	}
+
+	// NBD_SIMPLE_REPLY_MAGIC
+	err = c.WriteUint32(0x67446698)
+	if err != nil {
+		log.Printf("error: %v", err)
+		return
+	}
+	err = c.WriteUint32(0)
+	if err != nil {
+		log.Printf("error: %v", err)
+		return
+	}
+	err = c.WriteUint64(handle)
 	if err != nil {
 		log.Printf("error: %v", err)
 		return
