@@ -5,10 +5,14 @@ package nbd
 import (
 	"bufio"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+
+	"github.com/kochman/cloudblock"
+	"github.com/kochman/cloudblock/backends/file"
 )
 
 func Server() {
@@ -43,8 +47,44 @@ func newConnection(nc net.Conn) *connection {
 	return c
 }
 
+type export struct {
+	name string
+	h    cloudblock.Handle
+}
+
+func newExport(name string) (*export, error) {
+	const dir = "cloudblock-backend-file"
+	err := os.Mkdir(dir, 0755)
+	if err != nil && !os.IsExist(err) {
+		return nil, fmt.Errorf("unable to create dir: %v", err)
+	}
+
+	f, err := file.NewBackend(dir)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create file backend: %v", err)
+	}
+
+	// 1 gigabyte, 4 MB bands
+	fh, err := f.New(name, 1000*1000*1000, 4*1000*1000)
+	if err == cloudblock.HandleExists {
+		fh, err = f.Open(name)
+		if err != nil {
+			return nil, fmt.Errorf("unable to open handle: %v", err)
+		}
+	} else if err != nil {
+		return nil, fmt.Errorf("unable to create handle: %v", err)
+	}
+
+	e := &export{
+		name: name,
+		h:    fh,
+	}
+	return e, nil
+}
+
 func handle(c *connection) {
 	log.Printf("handling %s", c.nc.RemoteAddr())
+	defer c.Close()
 
 	// write some magic numbers
 	err := c.WriteUint64(0x4e42444d41474943)
@@ -110,14 +150,20 @@ func handle(c *connection) {
 			log.Printf("unable to read data: %v", err)
 			return
 		}
-		log.Printf("got opt [%v] length [%d] data [%v]", opt, l, data)
+		// log.Printf("got opt [%v] length [%d] data [%v]", opt, l, data)
 
 		switch opt {
 		case 7: // NBD_OPT_GO
 			p = make([]byte, 4)
 			l := binary.BigEndian.Uint32(data[:4])
 			name := data[4 : 4+l]
-			log.Printf("export name: %s", name)
+			// log.Printf("export name: %s", name)
+
+			e, err := newExport(string(name))
+			if err != nil {
+				log.Printf("bad export [%s]: %v", name, err)
+				return
+			}
 
 			// get info requests
 			offset := 4 + l
@@ -160,7 +206,13 @@ func handle(c *connection) {
 				log.Printf("error: %v", err)
 				return
 			}
-			err = c.WriteUint64(1e7)
+			// export size
+			size, err := e.h.Size()
+			if err != nil {
+				log.Printf("error: %v", err)
+				return
+			}
+			err = c.WriteUint64(size)
 			if err != nil {
 				log.Printf("error: %v", err)
 				return
@@ -201,6 +253,9 @@ func handle(c *connection) {
 				return
 			}
 
+			// if we got here then we're in transmission phase
+			handleTransmission(c, e)
+
 		default:
 			p = make([]byte, 8)
 			binary.BigEndian.PutUint64(p, 2^31+1)
@@ -209,6 +264,101 @@ func handle(c *connection) {
 	}
 
 	log.Printf("done")
+}
+
+func handleTransmission(c *connection, e *export) {
+	log.Printf("handling transmission for export [%s]", e.name)
+
+	for {
+		// requests start with NBD_REQUEST_MAGIC
+		magic, err := c.ReadUint32()
+		if err != nil {
+			log.Printf("error: %v", err)
+			return
+		}
+
+		if magic != 0x25609513 {
+			log.Printf("unknown magic num")
+			return
+		}
+
+		// handle request
+		cmdFlags, err := c.ReadUint16()
+		if err != nil {
+			log.Printf("error: %v", err)
+			return
+		}
+		_ = cmdFlags
+		typ, err := c.ReadUint16() // 0 is read, 1 is write, 2 is disconnect, 3 is flush...
+		if err != nil {
+			log.Printf("error: %v", err)
+			return
+		}
+		handle, err := c.ReadUint64()
+		if err != nil {
+			log.Printf("error: %v", err)
+			return
+		}
+		_ = handle
+		offset, err := c.ReadUint64()
+		if err != nil {
+			log.Printf("error: %v", err)
+		}
+		length, err := c.ReadUint32()
+		if err != nil {
+			log.Printf("error: %v", err)
+		}
+
+		switch typ {
+		case 0: // read
+			log.Printf("read request: offset %d length %d", offset, length)
+			handleRead(c, e.h, handle, offset, length)
+		case 1:
+			log.Printf("write request: offset %d length %d", offset, length)
+		case 2:
+			log.Printf("disconnect request")
+			return
+		default:
+			log.Printf("unhandled request type %d", typ)
+			return
+		}
+	}
+}
+
+func handleRead(c *connection, h cloudblock.Handle, handle, offset uint64, length uint32) {
+	p := make([]byte, length)
+	err := h.ReadAt(p, offset)
+	if err != nil {
+		log.Printf("error handling read: %v", err)
+		return
+	}
+
+	// NBD_SIMPLE_REPLY_MAGIC
+	err = c.WriteUint32(0x67446698)
+	if err != nil {
+		log.Printf("error: %v", err)
+		return
+	}
+	err = c.WriteUint32(0)
+	if err != nil {
+		log.Printf("error: %v", err)
+		return
+	}
+	err = c.WriteUint64(handle)
+	if err != nil {
+		log.Printf("error: %v", err)
+		return
+	}
+	err = c.Write(p)
+	if err != nil {
+		log.Printf("error: %v", err)
+		return
+	}
+	err = c.Flush()
+	if err != nil {
+		log.Printf("error: %v", err)
+		return
+	}
 }
 
 func (c *connection) ReadFull(p []byte) error {
@@ -264,6 +414,16 @@ func (c *connection) WriteUint64(data uint64) error {
 	return err
 }
 
+func (c *connection) Write(b []byte) error {
+	_, err := c.b.Write(b)
+	return err
+}
+
 func (c *connection) Flush() error {
 	return c.b.Flush()
+}
+
+func (c *connection) Close() {
+	c.b.Flush()
+	c.nc.Close()
 }

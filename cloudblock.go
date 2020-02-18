@@ -1,5 +1,7 @@
 package cloudblock
 
+import "errors"
+
 type Backend interface {
 	New(id string, size, blockSize uint64) (*Handle, error)
 	Open(id string) (*Handle, error)
@@ -12,3 +14,5 @@ type Handle interface {
 
 	Size() (uint64, error)
 }
+
+var HandleExists = errors.New("handle exists")

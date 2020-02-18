@@ -7,6 +7,8 @@ import (
 	"os"
 	"path"
 	"strconv"
+
+	"github.com/kochman/cloudblock"
 )
 
 func NewBackend(dir string) (*Backend, error) {
@@ -34,6 +36,9 @@ func (b *Backend) New(id string, size, blockSize uint64) (*Handle, error) {
 	p := path.Join(b.dir, id)
 	err := os.Mkdir(p, 0755)
 	if err != nil {
+		if os.IsExist(err) {
+			return nil, cloudblock.HandleExists
+		}
 		return nil, fmt.Errorf("unable to create dir: %w", err)
 	}
 
@@ -106,9 +111,14 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 	// determine which band we're reading from
 	idx := offset / h.blockSize
 	src := path.Join(h.dir, "bands", strconv.FormatUint(idx, 36))
+	notExist := false
 	f, err := os.Open(src)
 	if err != nil {
-		return fmt.Errorf("unable to open band: %w", err)
+		// check if this bad boy is just zeros
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("unable to open band: %w", err)
+		}
+		notExist = true
 	}
 	defer f.Close()
 
@@ -122,15 +132,22 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 		p = p[:h.blockSize-off]
 	}
 
-	n, err := f.ReadAt(p, int64(off))
-	if err != nil {
-		if err == io.EOF {
-			// it's zeros
-			for i := len(p); i > n; i-- {
-				p = append(p, 0)
+	if notExist {
+		// it's zeros
+		for i := 0; i < len(p); i++ {
+			p[i] = 0
+		}
+	} else {
+		n, err := f.ReadAt(p, int64(off))
+		if err != nil {
+			if err == io.EOF {
+				// it's zeros
+				for i := len(p); i > n; i-- {
+					p = append(p, 0)
+				}
+			} else {
+				return fmt.Errorf("unable to read from band: %w", err)
 			}
-		} else {
-			return fmt.Errorf("unable to read from band: %w", err)
 		}
 	}
 
