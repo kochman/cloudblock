@@ -12,7 +12,7 @@ import (
 	"os"
 
 	"github.com/kochman/cloudblock"
-	"github.com/kochman/cloudblock/backends/file"
+	"github.com/kochman/cloudblock/backends/gcs"
 )
 
 func Server() {
@@ -53,15 +53,20 @@ type export struct {
 }
 
 func newExport(name string) (*export, error) {
-	const dir = "cloudblock-backend-file"
-	err := os.Mkdir(dir, 0755)
-	if err != nil && !os.IsExist(err) {
-		return nil, fmt.Errorf("unable to create dir: %v", err)
-	}
+	// const dir = "cloudblock-backend-file"
+	// err := os.Mkdir(dir, 0755)
+	// if err != nil && !os.IsExist(err) {
+	// 	return nil, fmt.Errorf("unable to create dir: %v", err)
+	// }
 
-	f, err := file.NewBackend(dir)
+	// f, err := file.NewBackend(dir)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("unable to create file backend: %v", err)
+	// }
+
+	f, err := gcs.NewBackend("repl-cloudblock")
 	if err != nil {
-		return nil, fmt.Errorf("unable to create file backend: %v", err)
+		return nil, fmt.Errorf("unable to create GCS backend: %v", err)
 	}
 
 	// 1 gigabyte, 4 MB bands

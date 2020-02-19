@@ -1,6 +1,7 @@
 package gcs
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/kochman/cloudblock"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
@@ -22,7 +24,7 @@ type Backend struct {
 
 func NewBackend(bucket string) (*Backend, error) {
 	ctx := context.Background()
-	client, err := storage.NewClient(ctx, option.WithCredentialsFile("/Users/sidney/Projects/cloudblock/cloudblock-267721-f144a49fe420.json"))
+	client, err := storage.NewClient(ctx, option.WithCredentialsFile("/Users/sidney/Work/cloudblock/marine-cycle-160323-e681654dbc52.json"))
 	if err != nil {
 		return nil, fmt.Errorf("unable to create client: %w", err)
 	}
@@ -46,7 +48,7 @@ func (b *Backend) New(id string, size, blockSize uint64) (*Handle, error) {
 	obj := b.b.Object(id + "/manifest.json")
 	_, err := obj.Attrs(ctx)
 	if err != storage.ErrObjectNotExist {
-		return nil, fmt.Errorf("manifest already exists")
+		return nil, cloudblock.HandleExists
 	}
 
 	// write a manifest with some info about this file
@@ -249,7 +251,7 @@ func (h *Handle) finalizeTransactions() error {
 			return fmt.Errorf("unable to write transaction to band: %w", err)
 		}
 
-		timeout := time.After(time.Second)
+		timeout := time.After(1500 * time.Millisecond)
 		bandRateLimiter[t.band] = func() {
 			<-timeout
 		}
@@ -277,7 +279,7 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 	//    the state we would have if transactions were finalized
 	err := h.finalizeTransactions()
 	if err != nil {
-		return err
+		return fmt.Errorf("unable to finalize transactions: %w", err)
 	}
 	ctx := context.Background()
 
@@ -297,21 +299,35 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 	}
 
 	// get a reader for the specific chunk of the band we need
-	f, err := h.b.Object(src).NewRangeReader(ctx, int64(off), int64(len(p)))
-	if err != nil {
+	bandExists := true
+	f, err := h.b.Object(src).NewReader(ctx)
+	if err == storage.ErrObjectNotExist {
+		// it's just zeros
+		bandExists = false
+	} else if err != nil {
 		return fmt.Errorf("unable to get band reader: %w", err)
+	} else {
+		defer f.Close()
 	}
-	defer f.Close()
 
-	n, err := f.Read(p)
-	if err != nil {
-		if err == io.EOF {
-			// it's zeros
-			for i := len(p); i > n; i-- {
-				p = append(p, 0)
+	if bandExists {
+		buf := bufio.NewReader(f)
+		_, err := buf.Discard(int(off))
+		n, err := buf.Read(p)
+		if err != nil {
+			if err == io.EOF {
+				// it's zeros
+				for i := len(p); i > n; i-- {
+					p = append(p, 0)
+				}
+			} else {
+				return fmt.Errorf("unable to read from band: %w", err)
 			}
-		} else {
-			return fmt.Errorf("unable to read from band: %w", err)
+		}
+	} else {
+		// it's zeros
+		for i := 0; i < len(p); i++ {
+			p[i] = 0
 		}
 	}
 
@@ -385,14 +401,38 @@ func (h *Handle) writeToBand(p []byte, offset uint64) error {
 		p = p[:h.blockSize-off]
 	}
 
-	// need to pad beginning with zeros
-	z := make([]byte, off)
-	_, err := f.Write(z)
-	if err != nil {
-		return fmt.Errorf("unable to pad band: %w", err)
+	// get the old stuff and write the new stuff on top
+	new := false
+	r, err := h.b.Object(dest).NewReader(ctx)
+	if err == storage.ErrObjectNotExist {
+		new = true
+	} else if err != nil {
+		return fmt.Errorf("unable to get band reader: %w", err)
+	} else {
+		defer r.Close()
 	}
 
-	_, err = f.Write(p)
+	var merged []byte
+	if new {
+		// need to pad beginning with zeros
+		merged = make([]byte, off)
+	} else {
+		merged, err = ioutil.ReadAll(r)
+		if err != nil {
+			return fmt.Errorf("unable to read existing data: %w", err)
+		}
+	}
+
+	// overwrite existing data with new bytes, or append if nothing underneath
+	for i := uint64(0); i < uint64(len(p)); i++ {
+		if off+i+1 > uint64(len(merged)) {
+			merged = append(merged, p[i])
+		} else {
+			merged[off+i] = p[i]
+		}
+	}
+
+	_, err = f.Write(merged)
 	if err != nil {
 		return fmt.Errorf("unable to write to band: %w", err)
 	}
