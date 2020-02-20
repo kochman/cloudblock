@@ -185,9 +185,9 @@ func TestWritesEverywhere(t *testing.T) {
 	// make sure we conform to the interface
 	var fh cloudblock.Handle
 
-	// 1 kilobyte, 55 byte bands
+	// 1 kilobyte, 51-byte bands
 	const size = 1000
-	fh, err = f.New("test-writes-everywhere", size, 55)
+	fh, err = f.New("test-writes-everywhere", size, 51)
 	if err != nil {
 		t.Fatalf("unable to create handle: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestBeeMovie(t *testing.T) {
 		}
 		p := make([]byte, len(script))
 		copy(p, script)
-		err = fh.WriteAt(script, written)
+		err = fh.WriteAt(p, written)
 		if err != nil {
 			t.Fatalf("unable to write: %v", err)
 		}

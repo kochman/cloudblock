@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -69,6 +71,7 @@ func (b *Backend) New(id string, size, blockSize uint64) (*Handle, error) {
 		prefix:    id,
 		size:      size,
 		blockSize: blockSize,
+		fm:        map[uint64]chan struct{}{},
 	}
 
 	return h, nil
@@ -95,6 +98,7 @@ func (b *Backend) Open(id string) (*Handle, error) {
 		prefix:    id,
 		size:      m.Size,
 		blockSize: m.BlockSize,
+		fm:        map[uint64]chan struct{}{},
 	}
 
 	err = h.finalizeTransactions()
@@ -143,6 +147,10 @@ type Handle struct {
 
 	// TODO: make sure this never wraps
 	txn uint64
+
+	// finalizer
+	fl sync.Mutex
+	fm map[uint64]chan struct{}
 }
 
 type manifest struct {
@@ -166,8 +174,182 @@ type transaction struct {
 	key string
 }
 
-// GCS only wants one write/obj/sec
-var bandRateLimiter = map[uint64]func(){}
+// TODO: don't let a blocker grow indefinitely
+type blocker struct {
+	l sync.Mutex
+	m map[uint64]<-chan time.Time
+}
+
+func (b *blocker) Block(k uint64) {
+	b.l.Lock()
+	ch, ok := b.m[k]
+	if !ok {
+		// set up a limiter
+		ch = time.Tick(1500 * time.Millisecond)
+		b.m[k] = ch
+	}
+	b.l.Unlock()
+	<-ch
+}
+
+var bandBlocker = blocker{m: map[uint64]<-chan time.Time{}}
+
+func (h *Handle) requestFinalization(band uint64) {
+	h.fl.Lock()
+	w, ok := h.fm[band]
+	if !ok {
+		w = make(chan struct{}, 1)
+		h.fm[band] = w
+		go func() {
+			for range w {
+				err := h.finalizeTransactionsForBand(band)
+				if err != nil {
+					log.Printf("background finalization error: %v", err)
+				}
+			}
+		}()
+	}
+	h.fl.Unlock()
+
+	// we only want to request a finalization if someone else hasn't already
+	select {
+	case w <- struct{}{}:
+	default:
+	}
+}
+
+func (h *Handle) finalizeTransactionsForBand(band uint64) error {
+	start := time.Now()
+	ctx := context.Background()
+
+	// discover any in-flight transactions
+	idxStr := strconv.FormatUint(band, 36)
+	txnPrefix := h.prefix + "/txns/" + idxStr + "-"
+	q := &storage.Query{Prefix: txnPrefix}
+	err := q.SetAttrSelection([]string{"Name"})
+	if err != nil {
+		return fmt.Errorf("unable to set attribute selection: %w", err)
+	}
+
+	txns := []transaction{}
+	it := h.b.Objects(ctx, q)
+	for {
+		attrs, err := it.Next()
+		if err == iterator.Done {
+			break
+		} else if err != nil {
+			return fmt.Errorf("unable to iterate: %w", err)
+		}
+
+		key := attrs.Name
+
+		split := strings.Split(key[len(txnPrefix):], "-")
+		if len(split) != 2 {
+			return fmt.Errorf("malformed transaction key")
+		}
+
+		txn, err := strconv.ParseUint(split[0], 10, 64)
+		if err != nil {
+			return fmt.Errorf("unable to parse transaction ID: %w", err)
+		}
+
+		offset, err := strconv.ParseUint(split[1], 10, 64)
+		if err != nil {
+			return fmt.Errorf("unable to parse offset: %w", err)
+		}
+
+		t := transaction{
+			band:   band,
+			id:     txn,
+			offset: offset,
+			key:    key,
+		}
+		txns = append(txns, t)
+	}
+	// we need to put these in numeric order by txn ID because GCS does lexicographic
+	sort.Slice(txns, func(i, j int) bool {
+		return txns[i].id < txns[j].id
+	})
+
+	// get the old stuff
+	new := false
+	dest := fmt.Sprintf("%s/bands/%s", h.prefix, idxStr)
+	r, err := h.b.Object(dest).NewReader(ctx)
+	if err == storage.ErrObjectNotExist {
+		new = true
+	} else if err != nil {
+		return fmt.Errorf("unable to get band reader: %w", err)
+	} else {
+		defer r.Close()
+	}
+
+	var merged []byte
+	if !new {
+		merged, err = ioutil.ReadAll(r)
+		if err != nil {
+			return fmt.Errorf("unable to read existing data: %w", err)
+		}
+	}
+
+	// write new data on top of the bands
+	for _, t := range txns {
+		obj := h.b.Object(t.key)
+
+		f, err := obj.NewReader(ctx)
+		if err != nil {
+			return fmt.Errorf("unable to get transaction reader: %w", err)
+		}
+		defer f.Close()
+		p, err := ioutil.ReadAll(f)
+		if err != nil {
+			return fmt.Errorf("unable to read from transaction: %w", err)
+		}
+
+		// figure out if we need to write some padding in the beginning
+		for uint64(len(merged)) < t.offset {
+			merged = append(merged, 0)
+		}
+
+		// overwrite existing data with new bytes, or append if nothing underneath
+		for i := uint64(0); i < uint64(len(p)); i++ {
+			if t.offset+i+1 > uint64(len(merged)) {
+				merged = append(merged, p[i])
+			} else {
+				merged[t.offset+i] = p[i]
+			}
+		}
+	}
+
+	// wait for rate limit to settle
+	bandBlocker.Block(band)
+
+	// write the band back out
+	f := h.b.Object(dest).NewWriter(ctx)
+	_, err = f.Write(merged)
+	if err != nil {
+		return fmt.Errorf("unable to write to band: %w", err)
+	}
+
+	err = f.Close()
+	if err != nil {
+		return fmt.Errorf("unable to close writer: %w", err)
+	}
+
+	// delete all the transactions after we've written them to the band.
+	// it's okay if we die after writing above and before deleting below,
+	// since replaying these transactions will result in the same state.
+	for _, t := range txns {
+		obj := h.b.Object(t.key)
+		err = obj.Delete(ctx)
+		if err != nil {
+			return fmt.Errorf("unable to delete transaction: %w", err)
+		}
+	}
+
+	log.Printf("finalize %s took %v", idxStr, time.Since(start))
+
+	return nil
+}
 
 func (h *Handle) finalizeTransactions() error {
 	ctx := context.Background()
@@ -180,7 +362,7 @@ func (h *Handle) finalizeTransactions() error {
 		return fmt.Errorf("unable to set attribute selection: %w", err)
 	}
 
-	txns := []transaction{}
+	bands := map[uint64]struct{}{}
 	it := h.b.Objects(ctx, q)
 	for {
 		attrs, err := it.Next()
@@ -201,67 +383,29 @@ func (h *Handle) finalizeTransactions() error {
 		if err != nil {
 			return fmt.Errorf("unable to parse band: %w", err)
 		}
-
-		txn, err := strconv.ParseUint(split[1], 10, 64)
-		if err != nil {
-			return fmt.Errorf("unable to parse transaction ID: %w", err)
+		if _, ok := bands[band]; !ok {
+			bands[band] = struct{}{}
 		}
-
-		offset, err := strconv.ParseUint(split[2], 10, 64)
-		if err != nil {
-			return fmt.Errorf("unable to parse offset: %w", err)
-		}
-
-		t := transaction{
-			band:   band,
-			id:     txn,
-			offset: offset,
-			key:    key,
-		}
-		txns = append(txns, t)
 	}
-	// we need to put these in numeric order by txn ID because GCS does lexicographic
-	sort.Slice(txns, func(i, j int) bool {
-		return txns[i].id < txns[j].id
-	})
 
-	// update the bands
-	for _, t := range txns {
-		if limit, ok := bandRateLimiter[t.band]; ok {
-			limit()
-			// no point in deleting since we're about to just overwrite it anyway
-		}
+	errs := make(chan error, len(bands))
+	wg := sync.WaitGroup{}
+	for band := range bands {
+		wg.Add(1)
+		go func(band uint64) {
+			defer wg.Done()
+			err := h.finalizeTransactionsForBand(band)
+			if err != nil {
+				errs <- fmt.Errorf("unable to finalize transactions for band: %w", err)
+			}
+		}(band)
+	}
 
-		obj := h.b.Object(t.key)
-
-		f, err := obj.NewReader(ctx)
-		if err != nil {
-			return fmt.Errorf("unable to get transaction reader: %w", err)
-		}
-		defer f.Close()
-		p, err := ioutil.ReadAll(f)
-		if err != nil {
-			return fmt.Errorf("unable to read from transaction: %w", err)
-		}
-
-		off := h.blockSize*t.band + t.offset
-
-		err = h.writeToBand(p, off)
-		if err != nil {
-			return fmt.Errorf("unable to write transaction to band: %w", err)
-		}
-
-		timeout := time.After(1500 * time.Millisecond)
-		bandRateLimiter[t.band] = func() {
-			<-timeout
-		}
-
-		// it's okay if we die after writing above and before deleting below,
-		// since replaying this transaction will result in the same state.
-		err = obj.Delete(ctx)
-		if err != nil {
-			return fmt.Errorf("unable to delete transaction: %w", err)
-		}
+	wg.Wait()
+	select {
+	case err := <-errs:
+		return err
+	default:
 	}
 
 	return nil
@@ -272,15 +416,6 @@ func (h *Handle) Close() error {
 }
 
 func (h *Handle) ReadAt(p []byte, offset uint64) error {
-	// for now, always finalize all transactions before reading.
-	// this is sloooooow. we should either:
-	//  - only finalize transactions for this band, or
-	//  - layer transactions on top of the band, if any, returning a view into
-	//    the state we would have if transactions were finalized
-	err := h.finalizeTransactions()
-	if err != nil {
-		return fmt.Errorf("unable to finalize transactions: %w", err)
-	}
 	ctx := context.Background()
 
 	// determine which band we're reading from
@@ -290,6 +425,16 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 
 	// adjust offset to account for band
 	off := offset % h.blockSize
+
+	// for now, always finalize all transactions before reading.
+	// this is sloooooow. we should either:
+	//  - only finalize transactions for this band, or
+	//  - layer transactions on top of the band, if any, returning a view into
+	//    the state we would have if transactions were finalized
+	err := h.finalizeTransactionsForBand(idx)
+	if err != nil {
+		return fmt.Errorf("unable to finalize transactions: %w", err)
+	}
 
 	// does this read need to wrap?
 	var rem []byte
@@ -374,6 +519,8 @@ func (h *Handle) WriteAt(p []byte, offset uint64) error {
 	if err != nil {
 		return fmt.Errorf("unable to close transaction writer: %w", err)
 	}
+
+	h.requestFinalization(idx)
 
 	if rem != nil {
 		return h.WriteAt(rem, offset+uint64(len(p)))
