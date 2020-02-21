@@ -2,6 +2,7 @@ package gcs
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -72,6 +73,9 @@ func (b *Backend) New(id string, size, blockSize uint64) (*Handle, error) {
 		size:      size,
 		blockSize: blockSize,
 		fm:        map[uint64]chan struct{}{},
+		bm:        map[uint64]*sync.Mutex{},
+		bcm:       map[uint64][]byte{},
+		gc:        newGCSCacher(b.b),
 	}
 
 	return h, nil
@@ -99,6 +103,9 @@ func (b *Backend) Open(id string) (*Handle, error) {
 		size:      m.Size,
 		blockSize: m.BlockSize,
 		fm:        map[uint64]chan struct{}{},
+		bm:        map[uint64]*sync.Mutex{},
+		bcm:       map[uint64][]byte{},
+		gc:        newGCSCacher(b.b),
 	}
 
 	err = h.finalizeTransactions()
@@ -132,7 +139,7 @@ func (b *Backend) Delete(id string) error {
 		obj := b.b.Object(attrs.Name)
 		err = obj.Delete(ctx)
 		if err != nil {
-			return fmt.Errorf("unable to delete [%s]", obj.ObjectName())
+			return fmt.Errorf("unable to delete [%s]: %w", obj.ObjectName(), err)
 		}
 	}
 	return nil
@@ -151,6 +158,40 @@ type Handle struct {
 	// finalizer
 	fl sync.Mutex
 	fm map[uint64]chan struct{}
+
+	// band locks
+	// we only want one thing operating on a band at a time
+	bl sync.Mutex
+	bm map[uint64]*sync.Mutex
+
+	// band cache
+	bcl sync.Mutex
+	bcm map[uint64][]byte
+
+	gc *gcsCacher
+}
+
+func (h *Handle) lockBand(band uint64) {
+	h.bl.Lock()
+	l, ok := h.bm[band]
+	if !ok {
+		l = &sync.Mutex{}
+		h.bm[band] = l
+	}
+	h.bl.Unlock()
+	l.Lock()
+}
+
+func (h *Handle) unlockBand(band uint64) {
+	h.bl.Lock()
+	h.bm[band].Unlock()
+	h.bl.Unlock()
+}
+
+func (h *Handle) cacheBand(band uint64, b []byte) {
+	h.bcl.Lock()
+	h.bcm[band] = b
+	h.bcl.Unlock()
 }
 
 type manifest struct {
@@ -202,10 +243,12 @@ func (h *Handle) requestFinalization(band uint64) {
 		h.fm[band] = w
 		go func() {
 			for range w {
+				h.lockBand(band)
 				err := h.finalizeTransactionsForBand(band)
 				if err != nil {
 					log.Printf("background finalization error: %v", err)
 				}
+				h.unlockBand(band)
 			}
 		}()
 	}
@@ -266,6 +309,11 @@ func (h *Handle) finalizeTransactionsForBand(band uint64) error {
 		}
 		txns = append(txns, t)
 	}
+
+	if len(txns) == 0 {
+		return nil
+	}
+
 	// we need to put these in numeric order by txn ID because GCS does lexicographic
 	sort.Slice(txns, func(i, j int) bool {
 		return txns[i].id < txns[j].id
@@ -274,13 +322,11 @@ func (h *Handle) finalizeTransactionsForBand(band uint64) error {
 	// get the old stuff
 	new := false
 	dest := fmt.Sprintf("%s/bands/%s", h.prefix, idxStr)
-	r, err := h.b.Object(dest).NewReader(ctx)
+	r, err := h.gc.Reader(dest)
 	if err == storage.ErrObjectNotExist {
 		new = true
 	} else if err != nil {
 		return fmt.Errorf("unable to get band reader: %w", err)
-	} else {
-		defer r.Close()
 	}
 
 	var merged []byte
@@ -334,6 +380,8 @@ func (h *Handle) finalizeTransactionsForBand(band uint64) error {
 	if err != nil {
 		return fmt.Errorf("unable to close writer: %w", err)
 	}
+
+	h.gc.Put(dest, merged)
 
 	// delete all the transactions after we've written them to the band.
 	// it's okay if we die after writing above and before deleting below,
@@ -394,6 +442,9 @@ func (h *Handle) finalizeTransactions() error {
 		wg.Add(1)
 		go func(band uint64) {
 			defer wg.Done()
+
+			h.lockBand(band)
+			defer h.unlockBand(band)
 			err := h.finalizeTransactionsForBand(band)
 			if err != nil {
 				errs <- fmt.Errorf("unable to finalize transactions for band: %w", err)
@@ -416,8 +467,9 @@ func (h *Handle) Close() error {
 }
 
 func (h *Handle) ReadAt(p []byte, offset uint64) error {
-	ctx := context.Background()
-
+	if offset+uint64(len(p)) > h.size {
+		panic("read outside bounds")
+	}
 	// determine which band we're reading from
 	idx := offset / h.blockSize
 	idxStr := strconv.FormatUint(idx, 36)
@@ -425,6 +477,9 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 
 	// adjust offset to account for band
 	off := offset % h.blockSize
+
+	h.lockBand(idx)
+	defer h.unlockBand(idx)
 
 	// for now, always finalize all transactions before reading.
 	// this is sloooooow. we should either:
@@ -445,14 +500,12 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 
 	// get a reader for the specific chunk of the band we need
 	bandExists := true
-	f, err := h.b.Object(src).NewReader(ctx)
+	f, err := h.gc.Reader(src)
 	if err == storage.ErrObjectNotExist {
 		// it's just zeros
 		bandExists = false
 	} else if err != nil {
 		return fmt.Errorf("unable to get band reader: %w", err)
-	} else {
-		defer f.Close()
 	}
 
 	if bandExists {
@@ -477,6 +530,7 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 	}
 
 	if rem != nil {
+		log.Printf("rem != nil")
 		err = h.ReadAt(rem, offset+uint64(len(p)))
 		if err != nil {
 			return err
@@ -489,6 +543,9 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 
 // WriteAt always writes transactions
 func (h *Handle) WriteAt(p []byte, offset uint64) error {
+	if offset+uint64(len(p)) > h.size {
+		panic("write outside bounds")
+	}
 	ctx := context.Background()
 
 	// adjust offset to account for band
@@ -538,6 +595,10 @@ func (h *Handle) writeToBand(p []byte, offset uint64) error {
 
 	// determine which band we're writing to
 	idx := offset / h.blockSize
+
+	h.lockBand(idx)
+	defer h.unlockBand(idx)
+
 	dest := fmt.Sprintf("%s/bands/%s", h.prefix, strconv.FormatUint(idx, 36))
 	f := h.b.Object(dest).NewWriter(ctx)
 
@@ -598,4 +659,39 @@ func (h *Handle) writeToBand(p []byte, offset uint64) error {
 
 func (h *Handle) Size() (uint64, error) {
 	return h.size, nil
+}
+
+type gcsCacher struct {
+	b *storage.BucketHandle
+	l sync.Mutex
+	c map[string][]byte
+}
+
+// TODO: this should probably be closeable
+func (gc *gcsCacher) Reader(key string) (io.Reader, error) {
+	gc.l.Lock()
+	defer gc.l.Unlock()
+
+	if b, ok := gc.c[key]; ok {
+		c := make([]byte, len(b))
+		copy(c, b)
+		return bytes.NewReader(c), nil
+	}
+	return gc.b.Object(key).NewReader(context.Background())
+}
+
+func (gc *gcsCacher) Put(key string, b []byte) {
+	c := make([]byte, len(b))
+	copy(c, b)
+
+	gc.l.Lock()
+	gc.c[key] = c
+	gc.l.Unlock()
+}
+
+func newGCSCacher(b *storage.BucketHandle) *gcsCacher {
+	return &gcsCacher{
+		b: b,
+		c: map[string][]byte{},
+	}
 }

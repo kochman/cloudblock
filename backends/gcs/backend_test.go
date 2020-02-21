@@ -3,6 +3,7 @@ package gcs
 import (
 	"bytes"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"testing"
 	"time"
@@ -18,7 +19,7 @@ func TestWriteRead(t *testing.T) {
 		t.Fatalf("unable to create file backend: %v", err)
 	}
 
-	if f.Delete("test-write-read") != nil {
+	if err := f.Delete("test-write-read"); err != nil {
 		t.Fatalf("unable to delete: %v", err)
 	}
 	time.Sleep(time.Second) // wait for rate limit to settle
@@ -263,6 +264,7 @@ func TestBeeMovie(t *testing.T) {
 
 	written := uint64(0)
 	for {
+		log.Printf("wrote: %d", written)
 		if written+uint64(len(script)) > size {
 			break
 		}
@@ -278,6 +280,7 @@ func TestBeeMovie(t *testing.T) {
 	// read it back
 	read := uint64(0)
 	for {
+		log.Printf("read: %d", read)
 		if read+uint64(len(script)) > size {
 			break
 		}
@@ -287,8 +290,68 @@ func TestBeeMovie(t *testing.T) {
 			t.Fatalf("unable to read: %v", err)
 		}
 		if !bytes.Equal(script, p) {
-			t.Fatalf("expected %v, got %v at offset %d", script, p, read)
+			// err := ioutil.WriteFile("hey", p, 0644)
+			// if err != nil {
+			// 	t.Fatalf("unable to write: %v", err)
+			// }
+			// t.Fail()
+			t.Fatalf("expected:\n[%s]\n\ngot:\n[%s]\n\nat offset %d", script, p, read)
 		}
-		read += uint64(len(script))
+		read += uint64(len(p))
+	}
+}
+
+func TestWriteAcrossBands(t *testing.T) {
+	t.Parallel()
+
+	f, err := NewBackend("repl-cloudblock")
+	if err != nil {
+		t.Fatalf("unable to create gcs backend: %v", err)
+	}
+
+	if err := f.Delete("test-write-across-bands"); err != nil {
+		t.Fatalf("unable to delete: %v", err)
+	}
+	time.Sleep(time.Second) // wait for rate limit to settle
+
+	// make sure we conform to the interface
+	var fh cloudblock.Handle
+
+	// 1 megabyte, 100 byte bands
+	fh, err = f.New("test-write-across-bands", 1000*1000, 100)
+	if err != nil {
+		t.Fatalf("unable to create handle: %v", err)
+	}
+
+	// generate some stuff
+	expected := []byte{}
+	for i := 0; i < 100; i++ {
+		expected = append(expected, []byte("hello")...)
+	}
+
+	p := make([]byte, len(expected))
+	copy(p, expected)
+	err = fh.WriteAt(p, 0)
+	if err != nil {
+		t.Fatalf("unable to write: %v", err)
+	}
+
+	// actual := make([]byte, len(p))
+	// err = fh.ReadAt(actual, 0)
+	// if err != nil {
+	// 	t.Errorf("unable to read: %v", err)
+	// }
+	// if !bytes.Equal(expected, actual) {
+	// 	t.Fatalf("mismatched:\n\nexpected: [%s]\n\nactual: [%s]", expected, actual)
+	// }
+
+	// read some stuff at an offset
+	actual := make([]byte, 500)
+	err = fh.ReadAt(actual, 250)
+	if err != nil {
+		t.Errorf("unable to read: %v", err)
+	}
+	if !bytes.Equal(expected[:500], actual) {
+		t.Fatalf("mismatched:\n\nexpected: [%v]\n\nactual: [%v]", expected, actual)
 	}
 }
