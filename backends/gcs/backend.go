@@ -492,14 +492,12 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 		return fmt.Errorf("unable to finalize transactions: %w", err)
 	}
 
-	readLen := uint64(len(p))
-
 	// does this read need to wrap?
-	var rem []byte
+	readLen := uint64(len(p))
 	if off+readLen >= h.blockSize {
 		readLen = h.blockSize - off
-		rem = p[h.blockSize-off:]
 	}
+	log.Printf("readLen: %d", readLen)
 	b := make([]byte, readLen)
 
 	// get a reader for the specific chunk of the band we need
@@ -518,7 +516,7 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 		if err != nil {
 			return fmt.Errorf("unable to discard from band: %w", err)
 		}
-		n, err := buf.Read(p)
+		n, err := buf.Read(b)
 		if err != nil {
 			if err == io.EOF {
 				// it's zeros
@@ -536,20 +534,20 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 		}
 	}
 
-	if readLen > uint64(len(p)) {
+	copy(p, b)
+
+	// continue reading from the next band if requested
+	if uint64(len(p))-readLen > 0 {
 		log.Printf("READING ADDITIONAL")
 
-		log.Printf("len(rem) before append: %d", len(rem))
-		err = h.ReadAt(rem, offset+uint64(len(p)))
+		rem := make([]byte, uint64(len(p))-readLen)
+		err = h.ReadAt(rem, offset+uint64(len(b)))
 		if err != nil {
 			return err
 		}
-		log.Printf("len(p) before append: %d", len(p))
-		log.Printf("[%s]", p)
-		log.Printf("[%s]", rem)
-		copy(p[len(p):], rem)
-		// p = append(p, rem...)
-		log.Printf("len(p) after append: %d", len(p))
+
+		copy(p[len(b):], rem)
+		log.Printf("spliced: [%s]", p)
 	}
 
 	return nil
