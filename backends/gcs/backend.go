@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -491,12 +492,15 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 		return fmt.Errorf("unable to finalize transactions: %w", err)
 	}
 
+	readLen := uint64(len(p))
+
 	// does this read need to wrap?
 	var rem []byte
-	if off+uint64(len(p)) >= h.blockSize {
+	if off+readLen >= h.blockSize {
+		readLen = h.blockSize - off
 		rem = p[h.blockSize-off:]
-		p = p[:h.blockSize-off]
 	}
+	b := make([]byte, readLen)
 
 	// get a reader for the specific chunk of the band we need
 	bandExists := true
@@ -511,12 +515,15 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 	if bandExists {
 		buf := bufio.NewReader(f)
 		_, err := buf.Discard(int(off))
+		if err != nil {
+			return fmt.Errorf("unable to discard from band: %w", err)
+		}
 		n, err := buf.Read(p)
 		if err != nil {
 			if err == io.EOF {
 				// it's zeros
-				for i := len(p); i > n; i-- {
-					p = append(p, 0)
+				for i := n; i < len(b); i++ {
+					b[i] = 0
 				}
 			} else {
 				return fmt.Errorf("unable to read from band: %w", err)
@@ -524,18 +531,25 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 		}
 	} else {
 		// it's zeros
-		for i := 0; i < len(p); i++ {
-			p[i] = 0
+		for i := 0; i < len(b); i++ {
+			b[i] = 0
 		}
 	}
 
-	if rem != nil {
-		log.Printf("rem != nil")
+	if readLen > uint64(len(p)) {
+		log.Printf("READING ADDITIONAL")
+
+		log.Printf("len(rem) before append: %d", len(rem))
 		err = h.ReadAt(rem, offset+uint64(len(p)))
 		if err != nil {
 			return err
 		}
-		p = append(p, rem...)
+		log.Printf("len(p) before append: %d", len(p))
+		log.Printf("[%s]", p)
+		log.Printf("[%s]", rem)
+		copy(p[len(p):], rem)
+		// p = append(p, rem...)
+		log.Printf("len(p) after append: %d", len(p))
 	}
 
 	return nil
@@ -552,8 +566,7 @@ func (h *Handle) WriteAt(p []byte, offset uint64) error {
 	off := offset % h.blockSize
 
 	// start a transaction
-	txn := h.txn
-	h.txn++
+	txn := atomic.AddUint64(&h.txn, 1)
 
 	// determine which band this transaction is writing to
 	idx := offset / h.blockSize

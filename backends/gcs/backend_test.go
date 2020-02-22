@@ -257,7 +257,7 @@ func TestBeeMovie(t *testing.T) {
 
 	// 1 megabyte, 50 kilobyte bands
 	const size = 1000 * 1000
-	fh, err = f.New("test-bee-movie", size, 50*1000)
+	fh, err = f.New("test-bee-movie", size, 100*1000)
 	if err != nil {
 		t.Fatalf("unable to create handle: %v", err)
 	}
