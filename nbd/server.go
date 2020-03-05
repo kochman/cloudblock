@@ -125,8 +125,11 @@ func handle(c *connection) {
 		return
 	}
 
+	log.Printf("waiting for opts")
+
 	// soak up all the client's opts
 	for {
+		log.Printf("handling opt")
 		p = make([]byte, 8)
 		c.nc.Read(p)
 		magic := binary.BigEndian.Uint64(p)
@@ -159,6 +162,7 @@ func handle(c *connection) {
 
 		switch opt {
 		case 7: // NBD_OPT_GO
+			log.Printf("handling export request NBD_OPT_GO")
 			p = make([]byte, 4)
 			l := binary.BigEndian.Uint32(data[:4])
 			name := data[4 : 4+l]
@@ -261,7 +265,55 @@ func handle(c *connection) {
 			// if we got here then we're in transmission phase
 			handleTransmission(c, e)
 
+		case 1: // NBD_OPT_EXPORT_NAME
+			// the only reason we implement this is because ubuntu 16.04 ships
+			// with an older nbd-client that doesn't support fixed newstyle
+			// negotiation
+			log.Printf("handling export request NBD_OPT_EXPORT_NAME")
+
+			name := string(data[:l])
+			e, err := newExport(string(name))
+			if err != nil {
+				log.Printf("bad export [%s]: %v", name, err)
+				return
+			}
+
+			// export size
+			size, err := e.h.Size()
+			if err != nil {
+				log.Printf("error: %v", err)
+				return
+			}
+			err = c.WriteUint64(size)
+			if err != nil {
+				log.Printf("error: %v", err)
+				return
+			}
+			// transmission flags
+			err = c.WriteUint16(0x8000)
+			if err != nil {
+				log.Printf("error: %v", err)
+				return
+			}
+			// zeros
+			z := make([]byte, 124)
+			err = c.Write(z)
+			if err != nil {
+				log.Printf("error: %v", err)
+				return
+			}
+
+			err = c.Flush()
+			if err != nil {
+				log.Printf("flush error: %v", err)
+				return
+			}
+
+			// if we got here then we're in transmission phase
+			handleTransmission(c, e)
+
 		default:
+			log.Printf("unknown opt [%d]", opt)
 			p = make([]byte, 8)
 			binary.BigEndian.PutUint64(p, 2^31+1)
 			c.nc.Write(p)
