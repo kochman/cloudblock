@@ -514,7 +514,11 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 		buf := bufio.NewReader(f)
 		_, err := buf.Discard(int(off))
 		if err != nil {
-			return fmt.Errorf("unable to discard from band: %w", err)
+			if err == io.EOF {
+				// it's empty!
+			} else {
+				return fmt.Errorf("unable to discard from band: %w", err)
+			}
 		}
 		n, err := buf.Read(b)
 		if err != nil {
