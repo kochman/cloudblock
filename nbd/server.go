@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync"
 
 	"github.com/kochman/cloudblock"
 	"github.com/kochman/cloudblock/backends/gcs"
@@ -51,6 +52,11 @@ type export struct {
 	name string
 	h    cloudblock.Handle
 }
+
+var activeExports = struct {
+	sync.Mutex
+	m map[string]struct{}
+}{m: map[string]struct{}{}}
 
 func newExport(name string) (*export, error) {
 	// const dir = "cloudblock-backend-file"
@@ -165,10 +171,26 @@ func handle(c *connection) {
 			log.Printf("handling export request NBD_OPT_GO")
 			p = make([]byte, 4)
 			l := binary.BigEndian.Uint32(data[:4])
-			name := data[4 : 4+l]
+			name := string(data[4 : 4+l])
 			// log.Printf("export name: %s", name)
 
-			e, err := newExport(string(name))
+			// see if someone else already has this export
+			activeExports.Lock()
+			_, ok := activeExports.m[name]
+			if ok {
+				activeExports.Unlock()
+				log.Printf("export [%s] already in use", name)
+				return
+			}
+			activeExports.m[name] = struct{}{}
+			defer func() {
+				activeExports.Lock()
+				delete(activeExports.m, name)
+				activeExports.Unlock()
+			}()
+			activeExports.Unlock()
+
+			e, err := newExport(name)
 			if err != nil {
 				log.Printf("bad export [%s]: %v", name, err)
 				return
@@ -272,7 +294,22 @@ func handle(c *connection) {
 			log.Printf("handling export request NBD_OPT_EXPORT_NAME")
 
 			name := string(data[:l])
-			e, err := newExport(string(name))
+
+			// see if someone else already has this export
+			activeExports.Lock()
+			_, ok := activeExports.m[name]
+			if ok {
+				activeExports.Unlock()
+				log.Printf("export [%s] already in use", name)
+				return
+			}
+			activeExports.m[name] = struct{}{}
+			defer func() {
+				delete(activeExports.m, name)
+			}()
+			activeExports.Unlock()
+
+			e, err := newExport(name)
 			if err != nil {
 				log.Printf("bad export [%s]: %v", name, err)
 				return
