@@ -497,7 +497,6 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 	if off+readLen >= h.blockSize {
 		readLen = h.blockSize - off
 	}
-	log.Printf("readLen: %d", readLen)
 	b := make([]byte, readLen)
 
 	// get a reader for the specific chunk of the band we need
@@ -542,16 +541,12 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 
 	// continue reading from the next band if requested
 	if uint64(len(p))-readLen > 0 {
-		log.Printf("READING ADDITIONAL")
-
 		rem := make([]byte, uint64(len(p))-readLen)
 		err = h.ReadAt(rem, offset+uint64(len(b)))
 		if err != nil {
 			return err
 		}
-
-		copy(p[len(b):], rem)
-		log.Printf("spliced: [%s]", p)
+		copy(p[readLen:], rem)
 	}
 
 	return nil

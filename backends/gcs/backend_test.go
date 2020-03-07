@@ -351,7 +351,12 @@ func TestWriteAcrossBands(t *testing.T) {
 	if err != nil {
 		t.Errorf("unable to read: %v", err)
 	}
-	if !bytes.Equal(expected[:500], actual) {
+	if !bytes.Equal(expected[250:500], actual[:250]) {
 		t.Fatalf("mismatched:\n\nexpected: [%v]\n\nactual: [%v]", expected, actual)
+	}
+	for i, b := range actual[250:] {
+		if b != 0 {
+			t.Fatalf("mismatched:\n\nexpected: [0]\n\nactual: [%v] at index %d", actual, i)
+		}
 	}
 }
