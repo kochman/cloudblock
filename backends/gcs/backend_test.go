@@ -257,7 +257,7 @@ func TestBeeMovie(t *testing.T) {
 
 	// 1 megabyte, 50 kilobyte bands
 	const size = 1000 * 1000
-	fh, err = f.New("test-bee-movie", size, 100*1000)
+	fh, err = f.New("test-bee-movie", size, 50*1000)
 	if err != nil {
 		t.Fatalf("unable to create handle: %v", err)
 	}
@@ -288,6 +288,11 @@ func TestBeeMovie(t *testing.T) {
 		err = fh.ReadAt(p, read)
 		if err != nil {
 			t.Fatalf("unable to read: %v", err)
+		}
+		for i, b := range p {
+			if b == 0 {
+				t.Fatalf("unexpected null byte at index %d", i)
+			}
 		}
 		if !bytes.Equal(script, p) {
 			// err := ioutil.WriteFile("hey", p, 0644)

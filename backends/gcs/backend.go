@@ -519,9 +519,9 @@ func (h *Handle) ReadAt(p []byte, offset uint64) error {
 				return fmt.Errorf("unable to discard from band: %w", err)
 			}
 		}
-		n, err := buf.Read(b)
+		n, err := io.ReadFull(buf, b)
 		if err != nil {
-			if err == io.EOF {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				// it's zeros
 				for i := n; i < len(b); i++ {
 					b[i] = 0
